@@ -1,7 +1,11 @@
 package org.elasticsearch.river.hbase;
 
 import org.apache.hadoop.hbase.util.Bytes;
-import org.apache.zookeeper.*;
+import org.apache.zookeeper.CreateMode;
+import org.apache.zookeeper.KeeperException;
+import org.apache.zookeeper.Watcher;
+import org.apache.zookeeper.ZooDefs;
+import org.apache.zookeeper.ZooKeeper;
 import org.apache.zookeeper.data.Stat;
 import org.elasticsearch.ElasticSearchException;
 import org.elasticsearch.action.admin.indices.status.ShardStatus;
@@ -11,7 +15,6 @@ import org.elasticsearch.common.logging.ESLogger;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
 import org.elasticsearch.common.xcontent.support.XContentMapValues;
 import org.elasticsearch.index.shard.IndexShardState;
-import org.elasticsearch.indices.IndexAlreadyExistsException;
 import org.elasticsearch.river.AbstractRiverComponent;
 import org.elasticsearch.river.River;
 import org.elasticsearch.river.RiverName;
@@ -33,6 +36,7 @@ public class HBaseRiver extends AbstractRiverComponent implements River, Uncaugh
 
   private static final String CONFIG_SPACE = "hbase";
   private static final int MAX_TRIES = 10;
+  private static final String NAMESPACE = "namespace";
   private final Client esClient;
   private volatile Runnable parser;
 
@@ -297,6 +301,11 @@ public class HBaseRiver extends AbstractRiverComponent implements River, Uncaugh
           new byte[0],
           ZooDefs.Ids.OPEN_ACL_UNSAFE,
           CreateMode.PERSISTENT);
+      zooKeeper.create(getZNode() + "/" + NAMESPACE,
+          new byte[0],
+          ZooDefs.Ids.OPEN_ACL_UNSAFE,
+          CreateMode.PERSISTENT);
+
     } catch (IOException e) {
       logger.error(e.getMessage());
     } catch (InterruptedException e) {

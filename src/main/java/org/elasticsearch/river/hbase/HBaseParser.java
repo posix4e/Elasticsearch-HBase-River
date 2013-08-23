@@ -1,13 +1,18 @@
 package org.elasticsearch.river.hbase;
 
+
 import com.google.protobuf.ByteString;
+import com.google.protobuf.RpcController;
+import com.google.protobuf.ServiceException;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.*;
-import org.apache.hadoop.hbase.ipc.*;
+import org.apache.hadoop.hbase.HBaseConfiguration;
+import org.apache.hadoop.hbase.KeyValue;
+import org.apache.hadoop.hbase.ipc.HBaseRPCErrorHandler;
+import org.apache.hadoop.hbase.ipc.RpcServer;
+import org.apache.hadoop.hbase.ipc.SimpleRpcScheduler;
+import org.apache.hadoop.hbase.protobuf.generated.AdminProtos;
 import org.apache.hadoop.hbase.regionserver.RegionServerServices;
-import org.apache.hadoop.hbase.regionserver.wal.HLog;
 import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
-import org.apache.zookeeper.WatchedEvent;
 import org.apache.zookeeper.Watcher;
 import org.elasticsearch.action.bulk.BulkRequestBuilder;
 import org.elasticsearch.action.bulk.BulkResponse;
@@ -30,14 +35,14 @@ import java.util.Map;
  */
 class HBaseParser extends UnimplementedInHRegionShim
     implements Watcher,
-    HRegionInterface,
     HBaseRPCErrorHandler,
     Runnable,
-    RegionServerServices {
+    RegionServerServices,
+    AdminProtos.AdminService.BlockingInterface {
 
   private final InetSocketAddress initialIsa;
   private final int port_number;
-  private HBaseServer server;
+  private RpcServer rpcServer;
   Configuration c;
 
   private final HBaseRiver river;
@@ -46,6 +51,17 @@ class HBaseParser extends UnimplementedInHRegionShim
   int numHandler;
   int metaHandlerCount;
   boolean verbose;
+
+  /**
+   * @return list of blocking services and their security info classes that this server supports
+   */
+  private List<RpcServer.BlockingServiceAndInterface> getServices() {
+    List<RpcServer.BlockingServiceAndInterface> bssi = new ArrayList<RpcServer.BlockingServiceAndInterface>(2);
+    bssi.add(new RpcServer.BlockingServiceAndInterface(
+        AdminProtos.AdminService.newReflectiveBlockingService(this),
+        AdminProtos.AdminService.BlockingInterface.class));
+    return bssi;
+  }
 
   HBaseParser(final HBaseRiver river, int port_number) {
     this.river = river;
@@ -56,83 +72,28 @@ class HBaseParser extends UnimplementedInHRegionShim
     verbose = true;
     c = HBaseConfiguration.create();
     this.port_number = port_number;
+    String name = "regionserver/" + initialIsa.toString();
+    SimpleRpcScheduler scheduler = new SimpleRpcScheduler(
+        c,
+        numHandler,
+        0, // we don't use high priority handlers in master
+        0, // we don't use replication handlers in master
+        null, // this is a DNC w/o high priority handlers
+        0);
+
+    try {
+      this.rpcServer = new RpcServer(this, name, getServices(),
+          initialIsa,
+          c,
+          scheduler);
+    } catch (IOException e) {
+      e.printStackTrace();  //To change body of catch statement use File | Settings | File Templates.
+    }
+
   }
 
   @Override
   public void run() {
-    try {
-      c = HBaseConfiguration.create();
-      RpcServer rpcServer = HBaseRPC.getServer(this,
-          new Class<?>[]{
-              HBaseRPCErrorHandler.class
-          },
-          initialIsa.getHostName(), // BindAddress is IP we got for this server.
-          initialIsa.getPort(),
-          numHandler,
-          metaHandlerCount,
-          verbose,
-          c,
-          HConstants.QOS_THRESHOLD);
-      rpcServer.setErrorHandler(this);
-      if (rpcServer instanceof HBaseServer) server = (HBaseServer) rpcServer;
-      rpcServer.start();
-    } catch (IOException e) {
-      this.logger.error("Unable to start RPCServer");
-    }
-  }
-
-  @Override
-  public void abort(String why, Throwable e) {
-    throw new RuntimeException("Not implemented");
-  }
-
-  @Override
-  public boolean isAborted() {
-    throw new RuntimeException("Not implemented");
-  }
-
-  @Override
-  public ProtocolSignature getProtocolSignature(
-      String protocol, long version, int clientMethodsHashCode)
-      throws IOException {
-    if (protocol.equals(HRegionInterface.class.getName())) {
-      return new ProtocolSignature(HRegionInterface.VERSION, null);
-    }
-    throw new IOException("Unknown protocol: " + protocol);
-  }
-
-  @Override
-  public long getProtocolVersion(final String protocol, final long clientVersion)
-      throws IOException {
-    if (protocol.equals(HRegionInterface.class.getName())) {
-      return HRegionInterface.VERSION;
-    }
-    throw new IOException("Unknown protocol: " + protocol);
-  }
-
-  @Override
-  public void process(WatchedEvent watchedEvent) {
-  }
-
-  @Override
-  public RpcServer getRpcServer() {
-    return server;
-  }
-
-  @Override
-  public void stop(String why) {
-    throw new RuntimeException("Not implemented");
-  }
-
-
-  @Override
-  public boolean isStopped() {
-    throw new RuntimeException("Not implemented");
-  }
-
-  @Override
-  public boolean isStopping() {
-    throw new RuntimeException("Not implemented");
   }
 
   public Configuration getConfiguration() {
@@ -144,15 +105,10 @@ class HBaseParser extends UnimplementedInHRegionShim
     throw new RuntimeException("Not implemented");
   }
 
-  public void replicateLogEntries(HLog.Entry[] entries) throws IOException {
-    for (HLog.Entry entry : entries) {
-      replicateLogEntry(entry);
-    }
-  }
-
-  private void replicateLogEntry(HLog.Entry entry) {
+  private void replicateLogEntry(AdminProtos.WALEntry entry) {
     final BulkRequestBuilder bulkRequest = this.river.getEsClient().prepareBulk();
-    for (KeyValue kv : entry.getEdit().getKeyValues()) {
+    for (ByteString kvBytes : entry.getKeyValueBytesList()) {
+      KeyValue kv = new KeyValue(kvBytes.toByteArray());
       final ESKey.Key key = ESKey
           .Key
           .newBuilder()
@@ -250,7 +206,15 @@ class HBaseParser extends UnimplementedInHRegionShim
     return null;
   }
 
-  public HServerInfo getHServerInfo() throws IOException {
-    return new HServerInfo(new HServerAddress(new InetSocketAddress(this.port_number)), 0, 0);
+  @Override
+  public AdminProtos.ReplicateWALEntryResponse replicateWALEntry(RpcController controller,
+                                                                 AdminProtos.ReplicateWALEntryRequest request)
+      throws ServiceException {
+    for (AdminProtos.WALEntry entry : request.getEntryList()) {
+      replicateLogEntry(entry);
+    }
+
+    return AdminProtos.ReplicateWALEntryResponse.newBuilder().build();
   }
+
 }
